@@ -17,6 +17,7 @@ import checkAnswer from 'qb-answer-checker';
 import Team from '../../quizbowl/Team.js';
 
 const BAN_DURATION = 1000 * 60 * 30; // 30 minutes
+const PAUSE_COOLDOWN_DURATION = 90000;
 
 const ServerMultiplayerRoomMixin = (RoomClass) => class extends RoomClass {
   constructor (name, ownerId, isPermanent, categoryManager, supportedQuestionTypes) {
@@ -34,6 +35,7 @@ const ServerMultiplayerRoomMixin = (RoomClass) => class extends RoomClass {
     this.kickedUserList = new Map();
     this.votekickList = [];
     this.lastVotekickTime = {};
+    this.lastPauseTime = 0;
 
     this.rateLimiter = new RateLimit(50, 1000);
     this.rateLimitExceeded = new Set();
@@ -42,7 +44,8 @@ const ServerMultiplayerRoomMixin = (RoomClass) => class extends RoomClass {
       lock: false,
       loginRequired: false,
       public: true,
-      controlled: false
+      controlled: false,
+      antiSpamPause: false
     };
 
     getSetList().then(setList => { this.packetList = setList; });
@@ -59,6 +62,7 @@ const ServerMultiplayerRoomMixin = (RoomClass) => class extends RoomClass {
       case 'toggle-lock': return this.toggleLock(userId, message);
       case 'toggle-login-required': return this.toggleLoginRequired(userId, message);
       case 'toggle-mute': return this.toggleMute(userId, message);
+      case 'toggle-anti-spam-pause': return this.toggleAntiSpamPause(userId, message);
       case 'toggle-public': return this.togglePublic(userId, message);
       case 'votekick-init': return this.votekickInit(userId, message);
       case 'votekick-vote': return this.votekickVote(userId, message);
@@ -311,12 +315,55 @@ const ServerMultiplayerRoomMixin = (RoomClass) => class extends RoomClass {
     this.emitMessage({ type: 'set-username', userId, oldUsername, newUsername });
   }
 
+  pause (userId) {
+    if (this.buzzedIn) { return false; }
+    if (this.tossupProgress === TOSSUP_PROGRESS_ENUM.ANSWER_REVEALED) { return false; }
+
+    const currentTime = Date.now();
+    // Only throttle transitions into paused state so resume is never blocked.
+    if (this.settings.antiSpamPause && !this.paused) {
+      if (this.lastPauseTime && (currentTime - this.lastPauseTime < PAUSE_COOLDOWN_DURATION)) {
+        return false;
+      }
+      this.lastPauseTime = currentTime;
+    }
+
+    this.paused = !this.paused;
+    if (this.paused) {
+      clearTimeout(this.timeoutID);
+      clearInterval(this.timer.interval);
+    } else if (this.wordIndex >= this.questionSplit.length) {
+      this.startServerTimer(
+        this.timer.timeRemaining,
+        (time) => this.emitMessage({ type: 'timer-update', timeRemaining: time }),
+        () => this.revealTossupAnswer()
+      );
+    } else {
+      this.readQuestion(Date.now());
+    }
+
+    const username = this.players[userId].username;
+    this.emitMessage({
+      type: 'pause',
+      paused: this.paused,
+      username,
+      pauseCooldownUntil: this.settings.antiSpamPause ? this.lastPauseTime + PAUSE_COOLDOWN_DURATION : null
+    });
+  }
+
   toggleControlled (userId, { controlled }) {
     if (this.settings.public) { return; }
     if (userId !== this.ownerId) { return; }
     this.settings.controlled = !!controlled;
     const username = this.players[userId].username;
     this.emitMessage({ type: 'toggle-controlled', controlled, username });
+  }
+
+  toggleAntiSpamPause (userId, { antiSpamPause }) {
+    if (this.settings.public || !this.allowed(userId)) { return; }
+    this.settings.antiSpamPause = !!antiSpamPause;
+    const username = this.players[userId].username;
+    this.emitMessage({ type: 'toggle-anti-spam-pause', antiSpamPause: this.settings.antiSpamPause, username });
   }
 
   toggleEnableBonuses (userId, { enableBonuses }) {
@@ -366,6 +413,7 @@ const ServerMultiplayerRoomMixin = (RoomClass) => class extends RoomClass {
       this.settings.lock = false;
       this.settings.loginRequired = false;
       this.settings.timer = true;
+      this.settings.antiSpamPause = false;
     }
     this.emitMessage({ type: 'toggle-public', public: isPublic, username });
   }
